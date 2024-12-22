@@ -5,12 +5,17 @@ import {
   dataSource,
   ethereum,
   log,
+  Bytes,
+  ByteArray,
+  crypto,
 } from "@graphprotocol/graph-ts";
 import { PriceOracleUpdated } from "../generated/LendingPoolAddressesProvider/LendingPoolAddressesProvider";
 import {
   FLASHLOAN_PREMIUM_TOTAL,
   getNetworkSpecificConstant,
-  Protocol
+  Protocol,
+  Transaction,
+  WETH_GATEWAY_ADDRESS
 } from "./helper/constants";
 import {
   BorrowingDisabledOnReserve,
@@ -64,7 +69,22 @@ import {
   PositionSide,
   TransactionType,
   FeeType,
-  TokenType
+  TokenType,
+  WAD,
+  RAY,
+  RAD,
+  ILK_SAI,
+  BIGDECIMAL_ONE,
+  BIGDECIMAL_ONE_HUNDRED,
+  SECONDS_PER_YEAR_BIGDECIMAL,
+  VOW_ADDRESS,
+  ZAR_ADDRESS,
+  ProtocolSideRevenueType,
+  BIGDECIMAL_NEG_ONE,
+  BIGINT_NEGATIVE_ONE,
+  INT_ZERO,
+  INT_ONE,
+  MIGRATION_ADDRESS,
 } from "./helper/constants";
 import {
   Account,
@@ -73,6 +93,12 @@ import {
   Protocol as LendingProtocol,
   _DefaultOracle,
   _FlashLoanPremium,
+  _FlipBidsStore,
+  _ClipTakeStore,
+  _Urn,
+  _Proxy,
+  _Cdpi,
+  _Ilk,
 } from "../generated/schema";
 import { ZarbanIncentivesController } from "../generated/LendingPool/ZarbanIncentivesController";
 import { StakedZarban } from "../generated/LendingPool/StakedZarban";
@@ -106,11 +132,74 @@ import { ERC20 } from "../generated/LendingPool/ERC20";
 import { DataManager, ProtocolData, RewardData } from "./helper/manager";
 import { AccountManager } from "./helper/account";
 import { PositionManager } from "./helper/position";
+import { GemJoin } from "../generated/Vat/GemJoin";
+import {
+  Vat,
+  Rely as VatRelyEvent,
+  Cage as VatCageEvent,
+  Frob as VatFrobEvent,
+  Grab as VatGrabEvent,
+  Fork as VatForkEvent,
+  Fold as VatFoldEvent,
+} from "../generated/Vat/Vat";
+import {
+  Bark as BarkEvent,
+  File2 as DogFileChopEvent,
+} from "../generated/Dog/Dog";
+import { Clip } from "../generated/templates";
+import {
+  Take as TakeEvent,
+  Yank as ClipYankEvent,
+  Clip as ClipContract,
+} from "../generated/templates/Clip/Clip";
+import {
+  Poke as PokeEvent,
+  File as SpotFileMatEvent,
+  File2 as SpotFileParEvent,
+} from "../generated/Spot/Spot";
+import { Jug, File as JugFileEvent } from "../generated/Jug/Jug";
+import {
+  CdpManager,
+  NewCdp,
+} from "../generated/CdpManager/CdpManager";
+import {
+  bigIntToBDUseDecimals,
+  bigDecimalExponential,
+  bigIntChangeDecimals,
+} from "./utils/numbers";
+import {
+  bytesToUnsignedBigInt,
+} from "./utils/bytes";
+import {
+  updateUsageMetrics,
+  updateFinancialsSnapshot,
+  updateProtocol,
+  createTransactions,
+  updatePriceForMarket,
+  updateRevenue,
+  updateMarket,
+  snapshotMarket,
+  transferPosition,
+  liquidatePosition,
+  updatePosition,
+} from "./helper/helpers";
+import {
+  getOwnerAddress,
+  getOrCreateInterestRate,
+  getOrCreateMarket,
+  getOrCreateIlk,
+  getOrCreateToken,
+  getOrCreateLendingProtocol,
+  getMarketFromIlk,
+  getMarketAddressFromIlk,
+  getOrCreateLiquidate,
+} from "./helper/getters";
+import { createEventID } from "./utils/strings";
 
-function getProtocolData(): ProtocolData {
+export function getProtocolData(): ProtocolData {
   const constants = getNetworkSpecificConstant();
   return new ProtocolData(
-    constants.protocolAddress,
+    constants.protocolAddress.toHexString(),
     Protocol.PROTOCOL,
     Protocol.NAME,
     Protocol.SLUG,
@@ -154,33 +243,34 @@ export function handlePriceOracleUpdated(event: PriceOracleUpdated): void {
     return;
   } else {
     markets = protocol.markets.load();
-  } if (!markets) {
-    log.warning("[_handlePriceOracleUpdated] marketList for {} does not exist", [
-      protocolData.protocolID.toHexString(),
-    ]);
-    return;
-  }
-
-  for (let i = 0; i < markets.length; i++) {
-    const _market = Market.load(markets[i].id);
-    if (!_market) {
-      log.warning("[_handlePriceOracleUpdated] Market not found: {}", [
-        markets[i].id.toHexString(),
+    if (!markets) {
+      log.warning("[_handlePriceOracleUpdated] marketList for {} does not exist", [
+        protocolData.protocolID,
       ]);
-      continue;
+      return;
     }
-    const manager = new DataManager(
-      markets[i].id,
-      _market.inputToken,
-      event,
-      protocolData
-    );
-    _market.oracle = manager.getOrCreateOracle(
-      newPriceOracle,
-      true,
-      OracleSource.CHAINLINK
-    ).id;
-    _market.save();
+
+    for (let i = 0; i < markets.length; i++) {
+      const _market = Market.load(markets[i].id);
+      if (!_market) {
+        log.warning("[_handlePriceOracleUpdated] Market not found: {}", [
+          markets[i].id,
+        ]);
+        continue;
+      }
+      const manager = new DataManager(
+        markets[i].id,
+        _market.inputToken,
+        event,
+      );
+      _market.oracle = manager.getOrCreateOracle(
+        newPriceOracle,
+        true,
+        OracleSource.CHAINLINK
+      ).id;
+      _market.oracle
+      _market.save();
+    }
   }
 }
 
@@ -201,15 +291,14 @@ export function handleReserveInitialized(event: ReserveInitialized): void {
   ZTokenTemplate.create(outputToken);
 
   const manager = new DataManager(
-    outputToken,
-    underlyingToken,
+    outputToken.toHexString(),
+    underlyingToken.toHexString(),
     event,
-    protocolData
   );
   const market = manager.getMarket();
-  const outputTokenManager = new TokenManager(outputToken, event);
+  const outputTokenManager = new TokenManager(outputToken.toHexString(), event);
   const vDebtTokenManager = new TokenManager(
-    variableDebtToken,
+    variableDebtToken.toHexString(),
     event,
     TokenType.REBASING
   );
@@ -234,7 +323,7 @@ export function handleReserveInitialized(event: ReserveInitialized): void {
   vToken.save();
 
   if (stableDebtToken != Address.zero()) {
-    const sDebtTokenManager = new TokenManager(stableDebtToken, event);
+    const sDebtTokenManager = new TokenManager(stableDebtToken.toHexString(), event);
     const sToken = sDebtTokenManager.getToken();
     sToken._market = market.id;
     sToken._izarbanTokenType = IzarbanTokenType.STOKEN;
@@ -393,13 +482,11 @@ export function handleReserveDataUpdated(event: ReserveDataUpdated): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-
   updateRewards(manager, event);
 
   let assetPriceUSD = getAssetPriceInUSDC(
-    Address.fromBytes(market.inputToken),
+    Address.fromString(market.inputToken),
     manager.getOracleAddress(),
     event.block.number
   ) || BIGDECIMAL_ZERO;
@@ -417,13 +504,13 @@ export function handleReserveDataUpdated(event: ReserveDataUpdated): void {
   let trySBorrowBalance: ethereum.CallResult<BigInt> | null = null;
   if (market._sToken) {
     const stableDebtContract = StableDebtToken.bind(
-      Address.fromBytes(market._sToken!)
+      Address.fromString(market._sToken!)
     );
     trySBorrowBalance = stableDebtContract.try_totalSupply();
   }
 
   const variableDebtContract = VariableDebtToken.bind(
-    Address.fromBytes(market._vToken!)
+    Address.fromString(market._vToken!)
   );
   const tryVBorrowBalance = variableDebtContract.try_totalSupply();
   let sBorrowBalance = BIGINT_ZERO;
@@ -447,12 +534,12 @@ export function handleReserveDataUpdated(event: ReserveDataUpdated): void {
   }
 
   // update total supply balance
-  const ZTokenContract = ZToken.bind(Address.fromBytes(market.outputToken!));
+  const ZTokenContract = ZToken.bind(Address.fromString(market.outputToken!));
   const tryTotalSupply = ZTokenContract.try_totalSupply();
   if (tryTotalSupply.reverted) {
     log.warning(
       "[ReserveDataUpdated] Error getting total supply on market: {}",
-      [market.id.toHexString()]
+      [market.id]
     );
     return;
   }
@@ -590,7 +677,7 @@ export function handleReserveUsedAsCollateralEnabled(event: ReserveUsedAsCollate
     );
     return;
   }
-  const accountManager = new AccountManager(accountID);
+  const accountManager = new AccountManager(accountID.toHexString());
   const account = accountManager.getAccount();
 
   const markets = account._enabledCollaterals
@@ -614,7 +701,7 @@ export function handleReserveUsedAsCollateralDisabled(event: ReserveUsedAsCollat
     );
     return;
   }
-  const accountManager = new AccountManager(accountID);
+  const accountManager = new AccountManager(accountID.toHexString());
   const account = accountManager.getAccount();
 
   const markets = account._enabledCollaterals
@@ -642,7 +729,7 @@ export function handlePaused(event: Paused): void {
   }
   if (!markets) {
     log.warning("[_handlePaused]marketList for {} does not exist", [
-      protocolData.protocolID.toHexString(),
+      protocolData.protocolID,
     ]);
     return;
   }
@@ -650,7 +737,7 @@ export function handlePaused(event: Paused): void {
   for (let i = 0; i < markets.length; i++) {
     const market = Market.load(markets[i].id);
     if (!market) {
-      log.warning("[Paused] Market not found: {}", [markets[i].id.toHexString()]);
+      log.warning("[Paused] Market not found: {}", [markets[i].id]);
       continue;
     }
 
@@ -673,7 +760,7 @@ export function handleUnpaused(event: Unpaused): void {
   }
   if (!markets) {
     log.warning("[_handleUnpaused]marketList for {} does not exist", [
-      protocolData.protocolID.toHexString(),
+      protocolData.protocolID,
     ]);
     return;
   }
@@ -682,7 +769,7 @@ export function handleUnpaused(event: Unpaused): void {
     const market = Market.load(markets[i].id);
     if (!market) {
       log.warning("[_handleUnpaused] Market not found: {}", [
-        markets[i].id.toHexString(),
+        markets[i].id,
       ]);
       continue;
     }
@@ -705,22 +792,21 @@ export function handleDeposit(event: Deposit): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const tokenManager = new TokenManager(asset, event, TokenType.REBASING);
-  const amountUSD = tokenManager.getAmountUSD(amount);
+  const tokenManager = new TokenManager(asset.toHexString(), event, TokenType.REBASING);
+  const amountUSD = tokenManager.getAmountUSD(amount, market);
   const newCollateralBalance = getCollateralBalance(market, accountID);
   const principal = getPrincipal(market, accountID, PositionSide.COLLATERAL);
   manager.createDeposit(
-    asset,
-    accountID,
+    asset.toHexString(),
+    accountID.toHexString(),
     amount,
     amountUSD,
     newCollateralBalance,
     null,
     principal
   );
-  const account = Account.load(accountID);
+  const account = Account.load(accountID.toHexString());
   if (!account) {
     log.warning("[_handleDeposit]account {} not found", [
       accountID.toHexString(),
@@ -745,7 +831,10 @@ export function handleDeposit(event: Deposit): void {
 export function handleWithdraw(event: Withdraw): void {
   const amount = event.params.amount;
   const asset = event.params.reserve;
-  const accountID = event.params.user;
+  let accountID = event.params.user;
+  if (accountID.toHexString().toLowerCase() == WETH_GATEWAY_ADDRESS) {
+    accountID = event.transaction.from;
+  }
   const market = getMarketFromToken(asset, protocolData);
   if (!market) {
     log.warning("[_handleWithdraw] Market for token {} not found", [
@@ -757,15 +846,15 @@ export function handleWithdraw(event: Withdraw): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const tokenManager = new TokenManager(asset, event, TokenType.REBASING);
-  const amountUSD = tokenManager.getAmountUSD(amount);
+
+  const tokenManager = new TokenManager(asset.toHexString(), event, TokenType.REBASING);
+  const amountUSD = tokenManager.getAmountUSD(amount, market);
   const newCollateralBalance = getCollateralBalance(market, accountID);
   const principal = getPrincipal(market, accountID, PositionSide.COLLATERAL);
   manager.createWithdraw(
-    asset,
-    accountID,
+    asset.toHexString(),
+    accountID.toHexString(),
     amount,
     amountUSD,
     newCollateralBalance,
@@ -791,10 +880,9 @@ export function handleBorrow(event: Borrow): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const tokenManager = new TokenManager(asset, event, TokenType.REBASING);
-  const amountUSD = tokenManager.getAmountUSD(amount);
+  const tokenManager = new TokenManager(asset.toHexString(), event, TokenType.REBASING);
+  const amountUSD = tokenManager.getAmountUSD(amount, market);
   const newBorrowBalances = getBorrowBalances(market, accountID);
   const principal = getPrincipal(
     market,
@@ -803,8 +891,8 @@ export function handleBorrow(event: Borrow): void {
   );
 
   manager.createBorrow(
-    asset,
-    accountID,
+    asset.toHexString(),
+    accountID.toHexString(),
     amount,
     amountUSD,
     newBorrowBalances[0].plus(newBorrowBalances[1]),
@@ -829,10 +917,9 @@ export function handleRepay(event: Repay): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const tokenManager = new TokenManager(asset, event, TokenType.REBASING);
-  const amountUSD = tokenManager.getAmountUSD(amount);
+  const tokenManager = new TokenManager(asset.toHexString(), event, TokenType.REBASING);
+  const amountUSD = tokenManager.getAmountUSD(amount, market);
   const newBorrowBalances = getBorrowBalances(market, accountID);
 
   // use debtToken Transfer event for Burn/Mint to determine interestRateType of the Repay event
@@ -855,8 +942,8 @@ export function handleRepay(event: Repay): void {
   );
 
   manager.createRepay(
-    asset,
-    accountID,
+    asset.toHexString(),
+    accountID.toHexString(),
     amount,
     amountUSD,
     newBorrowBalances[0].plus(newBorrowBalances[1]),
@@ -886,14 +973,13 @@ export function handleLiquidationCall(event: LiquidationCall): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
   const inputToken = manager.getInputToken();
   let inputTokenPriceUSD = market.inputTokenPriceUSD;
   if (!inputTokenPriceUSD) {
     log.warning(
       "[_handleLiquidate] Price of input token {} is not set, default to 0.0",
-      [inputToken.id.toHexString()]
+      [inputToken.id]
     );
     inputTokenPriceUSD = BIGDECIMAL_ZERO;
   }
@@ -902,22 +988,12 @@ export function handleLiquidationCall(event: LiquidationCall): void {
     .div(exponentToBigDecimal(inputToken.decimals))
     .times(inputTokenPriceUSD);
 
-  if (!market._liquidationProtocolFee) {
-    // liquidationProtocolFee is only set for v3 markets
-    log.warning(
-      "[_handleLiquidate]market {} _liquidationProtocolFee = null. Must be a v2 market, setting to 0.",
-      [collateralAsset.toHexString()]
-    );
-    market._liquidationProtocolFee = BIGDECIMAL_ZERO;
-    market.save();
-  }
-  let liquidationProtocolFeeUSD = BIGDECIMAL_ZERO;
 
   const fee = manager.getOrUpdateFee(
     FeeType.LIQUIDATION_FEE,
-    market._liquidationProtocolFee
+    BIGDECIMAL_ZERO
   );
-  manager.addProtocolRevenue(liquidationProtocolFeeUSD, fee);
+  manager.addProtocolRevenue(BIGDECIMAL_ZERO, fee);
 
   const debtTokenMarket = getMarketFromToken(debtAsset, protocolData);
   if (!debtTokenMarket) {
@@ -947,8 +1023,8 @@ export function handleLiquidationCall(event: LiquidationCall): void {
     PositionSide.COLLATERAL
   );
   const liquidate = manager.createLiquidate(
-    collateralAsset,
-    debtAsset,
+    collateralAsset.toHexString(),
+    debtAsset.toHexString(),
     liquidator,
     liquidatee,
     amount,
@@ -965,8 +1041,8 @@ export function handleLiquidationCall(event: LiquidationCall): void {
   }
 
   const liquidatedPositions = liquidate.positions;
-  const liquidateeAccount = new AccountManager(liquidatee).getAccount();
-  const protocol = manager.getOrCreateProtocol(protocolData);
+  const liquidateeAccount = new AccountManager(liquidatee.toHexString()).getAccount();
+  const protocol = manager.getOrCreateProtocol();
   // Use the Transfer event for debtToken to burn to determine the interestRateType for debtToken liquidated
 
   // Variable debt is liquidated first
@@ -981,7 +1057,7 @@ export function handleLiquidationCall(event: LiquidationCall): void {
   if (vBorrowerPositionBalance && vBorrowerPositionBalance.gt(BIGINT_ZERO)) {
     const vPrincipal = getPrincipal(
       market,
-      Address.fromBytes(liquidateeAccount.id),
+      Address.fromString(liquidateeAccount.id),
       PositionSide.BORROWER,
       InterestRateType.VARIABLE
     );
@@ -1012,7 +1088,7 @@ export function handleLiquidationCall(event: LiquidationCall): void {
   ) {
     const sPrincipal = getPrincipal(
       market,
-      Address.fromBytes(liquidateeAccount.id),
+      Address.fromString(liquidateeAccount.id),
       PositionSide.BORROWER,
       InterestRateType.STABLE
     );
@@ -1052,17 +1128,16 @@ export function handleFlashloan(event: FlashLoan): void {
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const tokenManager = new TokenManager(asset, event);
-  const amountUSD = tokenManager.getAmountUSD(amount);
+  const tokenManager = new TokenManager(asset.toHexString(), event);
+  const amountUSD = tokenManager.getAmountUSD(amount, market);
   const flashloan = manager.createFlashloan(
     asset,
     account,
     amount,
     amountUSD
   );
-  const premiumUSDTotal = tokenManager.getAmountUSD(premiumAmount);
+  const premiumUSDTotal = tokenManager.getAmountUSD(premiumAmount, market);
   flashloan.feeAmount = premiumAmount;
   flashloan.feeAmountUSD = premiumUSDTotal;
   flashloan.save();
@@ -1127,14 +1202,13 @@ export function handleSwapBorrowRateMode(event: Swap): void {
 
   const user = event.params.user;
   const newBorrowBalances = getBorrowBalances(market, event.params.user);
-  const account = new AccountManager(user).getAccount();
+  const account = new AccountManager(user.toHexString()).getAccount();
   const manager = new DataManager(
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
-  const protocol = manager.getOrCreateProtocol(protocolData);
+  const protocol = manager.getOrCreateProtocol();
   const sPositionManager = new PositionManager(
     account,
     market,
@@ -1151,13 +1225,13 @@ export function handleSwapBorrowRateMode(event: Swap): void {
   const variableTokenBalance = newBorrowBalances[1];
   const vPrincipal = getPrincipal(
     market,
-    Address.fromBytes(account.id),
+    Address.fromString(account.id),
     PositionSide.BORROWER,
     InterestRateType.VARIABLE
   );
   const sPrincipal = getPrincipal(
     market,
-    Address.fromBytes(account.id),
+    Address.fromString(account.id),
     PositionSide.BORROWER,
     InterestRateType.STABLE
   );
@@ -1293,7 +1367,7 @@ export function handleCollateralTransfer(event: CollateralTransfer): void {
     );
     return;
   }
-  const tokenManager = new TokenManager(asset, event);
+  const tokenManager = new TokenManager(asset.toHexString(), event);
   const assetToken = tokenManager.getToken();
   let interestRateType: string | null;
   if (assetToken._izarbanTokenType! == IzarbanTokenType.STOKEN) {
@@ -1318,12 +1392,11 @@ export function handleCollateralTransfer(event: CollateralTransfer): void {
   );
 
   const inputTokenManager = new TokenManager(market.inputToken, event);
-  const amountUSD = inputTokenManager.getAmountUSD(amount);
+  const amountUSD = inputTokenManager.getAmountUSD(amount, market);
   const manager = new DataManager(
     market.id,
     market.inputToken,
     event,
-    protocolData
   );
   manager.createTransfer(
     asset,
@@ -1343,7 +1416,7 @@ export function handleCollateralTransfer(event: CollateralTransfer): void {
 ///// Helpers /////
 ///////////////////
 
-function getAssetPriceInUSDC(
+export function getAssetPriceInUSDC(
   tokenAddress: Address,
   priceOracle: Address,
   blockNumber: BigInt
@@ -1369,7 +1442,7 @@ function getAssetPriceInUSDC(
 
 
   // last resort, should not be touched
-  const inputToken = Token.load(tokenAddress);
+  const inputToken = Token.load(tokenAddress.toHexString().toLowerCase());
   if (!inputToken) {
     log.warning(
       "[getAssetPriceInUSDC]token {} not found in Token entity; return BIGDECIMAL_ZERO",
@@ -1387,12 +1460,12 @@ function updateRewards(manager: DataManager, event: ethereum.Event): void {
   // Supply side the to address is the ZToken
   // Borrow side the to address is the variableDebtToken
   const market = manager.getMarket();
-  const ZTokenContract = ZToken.bind(Address.fromBytes(market.outputToken!));
+  const ZTokenContract = ZToken.bind(Address.fromString(market.outputToken!));
   const tryIncentiveController = ZTokenContract.try_getIncentivesController();
   if (tryIncentiveController.reverted) {
     log.warning(
       "[updateRewards]getIncentivesController() call for ZToken {} is reverted",
-      [market.outputToken!.toHexString()]
+      [market.outputToken!]
     );
     return;
   }
@@ -1400,10 +1473,10 @@ function updateRewards(manager: DataManager, event: ethereum.Event): void {
     tryIncentiveController.value
   );
   const tryBorrowRewards = incentiveControllerContract.try_assets(
-    Address.fromBytes(market._vToken!)
+    Address.fromString(market._vToken!)
   );
   const trySupplyRewards = incentiveControllerContract.try_assets(
-    Address.fromBytes(market.outputToken!)
+    Address.fromString(market.outputToken!)
   );
   const tryRewardAsset = incentiveControllerContract.try_REWARD_TOKEN();
 
@@ -1415,7 +1488,7 @@ function updateRewards(manager: DataManager, event: ethereum.Event): void {
     return;
   }
   // create reward tokens
-  const tokenManager = new TokenManager(tryRewardAsset.value, event);
+  const tokenManager = new TokenManager(tryRewardAsset.value.toHexString(), event);
   const rewardToken = tokenManager.getToken();
   const vBorrowRewardToken = tokenManager.getOrCreateRewardToken(
     RewardTokenType.VARIABLE_BORROW
@@ -1504,4 +1577,1039 @@ function updateRewards(manager: DataManager, event: ethereum.Event): void {
     );
     manager.updateRewards(depositRewardData);
   }
+}
+
+
+
+
+
+//////////////////////////////////////
+///// Stablecoin system handlers /////
+//////////////////////////////////////
+
+
+
+// Authorizating Vat (CDP engine)
+export function handleVatRely(event: VatRelyEvent): void {
+  const someAddress = event.params.usr;
+  log.debug("[handleVatRely]Input address = {}", [someAddress.toHexString()]);
+
+  // We don't know whether the address passed in is a valid 'market' (gemjoin) address
+  const marketContract = GemJoin.bind(someAddress);
+  const ilkCall = marketContract.try_ilk(); // collateral type
+  const gemCall = marketContract.try_gem(); // get market collateral token, referred to as 'gem'
+  if (ilkCall.reverted || gemCall.reverted) {
+    log.debug("[handleVatRely]Address {} is not a market", [
+      someAddress.toHexString(),
+    ]);
+    log.debug(
+      "[handleVatRely]ilkCall.revert = {} gemCall.reverted = {} at tx hash {}",
+      [
+        ilkCall.reverted.toString(),
+        gemCall.reverted.toString(),
+        event.transaction.hash.toHexString(),
+      ]
+    );
+
+    return;
+  }
+  const ilk = ilkCall.value;
+  const marketID = someAddress.toHexString();
+
+  const tokenId = gemCall.value.toHexString();
+  let tokenName = "unknown";
+  let tokenSymbol = "unknown";
+  let decimals = 18;
+  const erc20Contract = ERC20.bind(gemCall.value);
+  const tokenNameCall = erc20Contract.try_name();
+  if (tokenNameCall.reverted) {
+    log.warning("[handleVatRely]Failed to get name for token {}", [tokenId]);
+  } else {
+    tokenName = tokenNameCall.value;
+  }
+  const tokenSymbolCall = erc20Contract.try_symbol();
+  if (tokenSymbolCall.reverted) {
+    log.warning("[handleVatRely]Failed to get symbol for token {}", [tokenId]);
+  } else {
+    tokenSymbol = tokenSymbolCall.value;
+  }
+  const tokenDecimalsCall = erc20Contract.try_decimals();
+  if (tokenDecimalsCall.reverted) {
+    log.warning("[handleVatRely]Failed to get decimals for token {}", [
+      tokenId,
+    ]);
+  } else {
+    decimals = tokenDecimalsCall.value;
+  }
+
+  if (ilk.equals(Bytes.fromHexString(ILK_SAI))) {
+    // https://etherscan.io/address/0x89d24a6b4ccb1b6faa2625fe562bdd9a23260359#readContract
+    tokenName = "Zar Stablecoin";
+    tokenSymbol = "SAI";
+    decimals = 18;
+  }
+
+  log.info(
+    "[handleVatRely]ilk={}, market={}, token={}, name={}, symbol={}, decimals={}",
+    [
+      ilk.toString(),
+      marketID, //join (market address)
+      tokenId, //gem (token address)
+      tokenName,
+      tokenSymbol,
+      decimals.toString(),
+    ]
+  );
+  getOrCreateMarket(
+    marketID,
+    ilk.toString().concat(" Vault"),
+    tokenId,
+    event.block.number,
+    event.block.timestamp
+  );
+  getOrCreateIlk(ilk, marketID);
+  getOrCreateToken(tokenId, tokenName, tokenSymbol, decimals as i32);
+  // for protocol.mintedTokens
+  getOrCreateToken(ZAR_ADDRESS, "Zar Stablecoin", "ZAR", 18);
+
+}
+
+export function handleVatCage(event: VatCageEvent): void {
+  const protocol = getOrCreateLendingProtocol();
+  log.info("[handleVatCage]All markets paused with tx {}", [
+    event.transaction.hash.toHexString(),
+  ]);
+  // Vat.cage pauses all markets
+  for (let i: i32 = 0; i < protocol.marketIDList.length; i++) {
+    const market = getOrCreateMarket(protocol.marketIDList[i]);
+    market.isActive = false;
+    market.canBorrowFrom = false;
+    market.save();
+  }
+}
+
+export function handleVatGrab(event: VatGrabEvent): void {
+  // only needed for non-liquidations
+  if (!event.receipt) {
+    log.error("[handleVatGrab]no receipt found. Tx Hash: {}", [
+      event.transaction.hash.toHexString(),
+    ]);
+    return;
+  }
+
+  const liquidationSigs = [
+    crypto.keccak256(
+      ByteArray.fromUTF8(
+        "Bite(bytes32,address,uint256,uint256,uint256,address,uint256)"
+      )
+    ),
+
+    crypto.keccak256(
+      ByteArray.fromUTF8(
+        "Bark(bytes32,address,uint256,uint256,uint256,address,uint256)"
+      )
+    ),
+  ];
+
+  for (let i = 0; i < event.receipt!.logs.length; i++) {
+    const txLog = event.receipt!.logs[i];
+
+    if (liquidationSigs.includes(txLog.topics.at(0))) {
+      // it is a liquidation transaction; skip
+      log.info("[handleVatGrab]Skip handle grab() for liquidation tx {}-{}", [
+        event.transaction.hash.toHexString(),
+        event.transactionLogIndex.toString(),
+      ]);
+      return;
+    }
+  }
+
+  // Create a new VatFrobEvent
+  let frobEvent = new VatFrobEvent(event.address, event.logIndex, event.transactionLogIndex, event.logType, event.block, event.transaction, event.parameters, event.receipt);
+  handleVatFrob(frobEvent);
+}
+
+// Borrow/Repay/Deposit/Withdraw
+export function handleVatFrob(event: VatFrobEvent): void {
+  const ilk = event.params.i;
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  let u = event.params.u.toHexString();
+  let v = event.params.v.toHexString();
+  // frob(bytes32 i, address u, address v, address w, int256 dink, int256 dart) call
+  // 4th arg w: start = 4 (signature) + 3 * 32, end = start + 32
+  let w = event.params.w.toHexString();
+  // 5th arg dink: start = 4 (signature) + 4 * 32, end = start + 32
+  const dink = event.params.dink; // change to collateral
+  // 6th arg dart: start = 4 (signature) + 4 * 32, end = start + 32
+  const dart = event.params.dart; // change to debt
+  const tx = event.transaction.hash
+    .toHexString()
+    .concat("-")
+    .concat(event.transactionLogIndex.toString());
+  log.info(
+    "[handleVatFrob]tx {} block {}: ilk={}, u={}, v={}, w={}, dink={}, dart={}",
+    [
+      tx,
+      event.block.number.toString(),
+      ilk.toString(),
+      u,
+      v,
+      w,
+      dink.toString(),
+      dart.toString(),
+    ]
+  );
+
+  const urn = u;
+  const migrationCaller = getMigrationCaller(u, v, w, event);
+  if (migrationCaller != null && ilk.toString() == "SAI") {
+    // Ignore vat.frob calls not of interest
+    // - ignore swapSaiToZar() and swapZarToSai() calls:
+    //   https://github.com/makerdao/scd-mcd-migration/blob/96b0e1f54a3b646fa15fd4c895401cf8545fda60/src/ScdMcdMigration.sol#L76-L103
+    // - ignore the two migration frob calls that move SAI/ZAR around to balance accounting:
+    //   https://github.com/makerdao/scd-mcd-migration/blob/96b0e1f54a3b646fa15fd4c895401cf8545fda60/src/ScdMcdMigration.sol#L118-L125
+    //   https://github.com/makerdao/scd-mcd-migration/blob/96b0e1f54a3b646fa15fd4c895401cf8545fda60/src/ScdMcdMigration.sol#L148-L155
+
+    log.info(
+      "[handleVatFrob]account migration tx {} for urn={},migrationCaller={} skipped",
+      [tx, urn, migrationCaller!]
+    );
+
+    return;
+  }
+
+  // translate possible UrnHandler/DSProxy address to its owner address
+  u = getOwnerAddress(u);
+  v = getOwnerAddress(v);
+  w = getOwnerAddress(w);
+
+  const market = getMarketFromIlk(ilk);
+  if (market == null) {
+    log.warning("[handleVatFrob]Failed to get market for ilk {}/{}", [
+      ilk.toString(),
+      ilk.toHexString(),
+    ]);
+    return;
+  }
+
+  const token = new TokenManager(market.inputToken, event);
+  const deltaCollateral = bigIntChangeDecimals(dink, WAD, token.getDecimals());
+  const tokenPrice = token.getPriceUSD(market);
+  const deltaCollateralUSD = bigIntToBDUseDecimals(
+    deltaCollateral,
+    token.getDecimals()
+  ).times(tokenPrice);
+
+  log.info(
+    "[handleVatFrob]tx {} block {}: token.decimals={}, deltaCollateral={}, deltaCollateralUSD={}",
+    [
+      tx,
+      event.block.number.toString(),
+      token.getDecimals().toString(),
+      deltaCollateral.toString(),
+      deltaCollateralUSD.toString(),
+    ]
+  );
+
+  market.inputTokenPriceUSD = tokenPrice;
+
+
+
+
+  // change in borrowing amount  
+  const deltaDebt = bigIntToBDUseDecimals(dart, WAD); //in ZAR
+  // alternatively, use zar mapping on chain and include stablity fees
+  //let vatContract = Vat.bind(Address.fromString(VAT_ADDRESS));
+  //let dtab = dart.times(vatContract.ilks(ilk).getRate());
+  //deltaDebtUSD = bigIntToBDUseDecimals(dtab, RAD);
+
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+  const deltaDebtUSD = deltaDebt.times(tokenManager.getPriceUSD(market));
+
+  log.info(
+    "[handleVatFrob]inputTokenBal={}, inputTokenPrice={}, totalBorrowUSD={}",
+    [
+      market.inputTokenBalance.toString(),
+      market.inputTokenPriceUSD.toString(),
+      market.totalBorrowBalanceUSD.toString(),
+    ]
+  );
+
+  createTransactions(
+    event,
+    market,
+    v,
+    w,
+    deltaCollateral,
+    deltaCollateralUSD,
+    dart,
+    deltaDebtUSD
+  );
+  updateUsageMetrics(event, market, [u, v, w], deltaCollateralUSD, deltaDebtUSD);
+  updatePosition(event, urn, ilk, market, deltaCollateral, dart);
+  updateMarket(
+    event,
+    market,
+    deltaCollateral,
+    deltaCollateralUSD,
+    dart,
+    deltaDebtUSD
+  );
+  updateProtocol(deltaCollateralUSD, deltaDebtUSD);
+  //this needs to after updateProtocol as it uses protocol to do the update
+  updateFinancialsSnapshot(event, deltaCollateralUSD, deltaDebtUSD);
+}
+
+// function fork( bytes32 ilk, address src, address dst, int256 dink, int256 dart)
+// needed for position transfer
+export function handleVatFork(event: VatForkEvent): void {
+  const ilk = event.params.ilk;
+  const src = event.params.src.toHexString();
+  const dst = event.params.dst.toHexString();
+
+  // fork( bytes32 ilk, address src, address dst, int256 dink, int256 dart)
+  // 4th arg dink: start = 4 (signature) + 3 * 32, end = start + 32
+  const dink = event.params.dink; // change to collateral
+  // 5th arg dart: start = 4 (signature) + 4 * 32, end = start + 32
+  const dart = event.params.dart; // change to debt
+
+  const market: Market = getMarketFromIlk(ilk)!;
+  const token = getOrCreateToken(market.inputToken);
+  const collateralTransferAmount = bigIntChangeDecimals(
+    dink,
+    WAD,
+    token.decimals
+  );
+  const debtTransferAmount = dart;
+
+  log.info("[handleVatFork]ilk={}, src={}, dst={}, dink={}, dart={}", [
+    ilk.toString(),
+    src,
+    dst,
+    collateralTransferAmount.toString(),
+    debtTransferAmount.toString(),
+  ]);
+
+  if (dink.gt(BIGINT_ZERO)) {
+    transferPosition(
+      event,
+      ilk,
+      src,
+      dst,
+      PositionSide.COLLATERAL,
+      null,
+      null,
+      collateralTransferAmount
+    );
+  } else if (dink.lt(BIGINT_ZERO)) {
+    transferPosition(
+      event,
+      ilk,
+      dst,
+      src,
+      PositionSide.COLLATERAL,
+      null,
+      null,
+      collateralTransferAmount.times(BIGINT_NEGATIVE_ONE)
+    );
+  }
+
+  if (dart.gt(BIGINT_ZERO)) {
+    transferPosition(
+      event,
+      ilk,
+      src,
+      dst,
+      PositionSide.BORROWER,
+      null,
+      null,
+      debtTransferAmount
+    );
+  } else if (dart.lt(BIGINT_ZERO)) {
+    transferPosition(
+      event,
+      ilk,
+      dst,
+      src,
+      PositionSide.BORROWER,
+      null,
+      null,
+      debtTransferAmount.times(BIGINT_NEGATIVE_ONE)
+    );
+  }
+}
+
+// update total revenue (stability fee)
+export function handleVatFold(event: VatFoldEvent): void {
+  const ilk = event.params.i;
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  const vow = event.params.u.toHexString();
+  const rate = event.params.rate;
+  const vatContract = Vat.bind(event.address);
+  const ilkOnChain = vatContract.ilks(ilk);
+  const revenue = ilkOnChain.getArt().times(rate);
+  const newTotalRevenue = bigIntToBDUseDecimals(revenue, RAD);
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+
+  if (vow.toLowerCase() != VOW_ADDRESS.toLowerCase()) {
+    log.warning(
+      "[handleVatFold]Stability fee unexpectedly credited to a non-Vow address {}",
+      [vow]
+    );
+  }
+
+  const marketAddress = getMarketAddressFromIlk(ilk);
+  if (marketAddress) {
+    const marketID = marketAddress.toHexString();
+    const market = getOrCreateMarket(marketID);
+    const newTotalRevenueUSD = newTotalRevenue.times(tokenManager.getPriceUSD(market));
+    market.rateAcc = market.rateAcc.plus(new BigDecimal(rate));
+    market.save();
+    log.info("[handleVatFold]total revenue accrued from Market {}/{} = ${}", [
+      ilk.toString(),
+      marketID,
+      newTotalRevenueUSD.toString(),
+    ]);
+    updateRevenue(
+      event,
+      marketID,
+      newTotalRevenueUSD,
+      BIGDECIMAL_ZERO,
+      ProtocolSideRevenueType.STABILITYFEE
+    );
+  } else {
+    log.warning(
+      "[handleVatFold]Failed to find marketID for ilk {}/{}; ",
+      [ilk.toString(), ilk.toHexString()]
+    );
+  }
+}
+
+// New liquidation
+export function handleDogBark(event: BarkEvent): void {
+  const ilk = event.params.ilk; //market
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  const urn = event.params.urn; //liquidatee
+  const clip = event.params.clip; //auction contract
+  const id = event.params.id; //auction id
+  const lot = event.params.ink;
+  const art = event.params.art;
+  const due = event.params.due; //including interest, but not penalty
+
+  const market = getMarketFromIlk(ilk)!;
+  const token = new TokenManager(market.inputToken, event);
+  const tokenPrice = token.getPriceUSD(market);
+  const collateral = bigIntChangeDecimals(lot, WAD, token.getDecimals());
+  const collateralUSD = bigIntToBDUseDecimals(collateral, token.getDecimals()).times(
+    tokenPrice
+  );
+  const deltaCollateral = collateral.times(BIGINT_NEGATIVE_ONE);
+  const deltaCollateralUSD = collateralUSD.times(BIGDECIMAL_NEG_ONE);
+  const deltaDebt = bigIntToBDUseDecimals(art, WAD).times(
+    BIGDECIMAL_NEG_ONE
+  );
+
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+  const deltaDebtUSD = deltaDebt.times(tokenManager.getPriceUSD(market));
+
+  // Here we remove all collateral and close positions, even though partial collateral may be returned
+  // to the urn, it is no longer "locked", the user would need to call `vat.frob` again to move the collateral
+  // from gem to urn (locked); so it is clearer to remove all collateral at initiation of liquidation
+  const liquidatedPositionIds = liquidatePosition(
+    event,
+    urn.toHexString(),
+    ilk,
+    collateral,
+    art
+  );
+  updateMarket(
+    event,
+    market,
+    deltaCollateral,
+    deltaCollateralUSD,
+    art,
+    deltaDebtUSD
+  );
+  updateProtocol();
+  updateFinancialsSnapshot(event);
+
+  const liquidationRevenue = bigIntToBDUseDecimals(due, RAD).times(
+    market.liquidationPenalty.div(BIGDECIMAL_ONE_HUNDRED)
+  );
+  const liquidationRevenueUSD = liquidationRevenue.times(tokenManager.getPriceUSD(market));
+  market.save();
+
+  updateRevenue(
+    event,
+    market.id,
+    liquidationRevenueUSD,
+    BIGDECIMAL_ZERO,
+    ProtocolSideRevenueType.LIQUIDATION
+  );
+
+  const storeID = clip.toHexString().concat("-").concat(id.toString());
+  log.info(
+    "[handleDogBark]storeID={}, ilk={}, urn={}: lot={}, art={}, due={}, liquidation revenue=${}",
+    [
+      storeID,
+      ilk.toString(),
+      urn.toHexString(),
+      lot.toString(),
+      art.toString(),
+      due.toString(),
+      liquidationRevenueUSD.toString(),
+    ]
+  );
+
+  //let debt = bigIntChangeDecimals(due, RAD, WAD);
+  const clipTakeStore = new _ClipTakeStore(storeID);
+  clipTakeStore.slice = INT_ZERO;
+  clipTakeStore.ilk = ilk.toHexString();
+  clipTakeStore.market = market.id;
+  clipTakeStore.urn = urn.toHexString();
+  clipTakeStore.lot = lot;
+  clipTakeStore.art = art;
+  clipTakeStore.tab = due; //not including penalty
+  clipTakeStore.tab0 = due;
+  clipTakeStore.positions = liquidatedPositionIds;
+  clipTakeStore.save();
+
+  Clip.create(clip);
+}
+
+// Update liquidate penalty for the Dog contract
+export function handleDogFile(event: DogFileChopEvent): void {
+  const ilk = event.params.ilk;
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  const what = event.params.what.toString();
+  if (what != "chop") {
+    return;
+  }
+  const market = getMarketFromIlk(ilk);
+  if (market == null) {
+    log.warning("[handleFileDog]Failed to get Market for ilk {}/{}", [
+      ilk.toString(),
+      ilk.toHexString(),
+    ]);
+    return;
+  }
+  const chop = event.params.data;
+  const liquidationPenalty = bigIntToBDUseDecimals(chop, WAD)
+    .minus(BIGDECIMAL_ONE)
+    .times(BIGDECIMAL_ONE_HUNDRED);
+  if (liquidationPenalty.ge(BIGDECIMAL_ZERO)) {
+    market.liquidationPenalty = liquidationPenalty;
+    market.save();
+  }
+
+  log.info(
+    "[handleDogFile]ilk={}, chop={}, liquidationPenalty={}, market.liquidationPenalty={}",
+    [
+      ilk.toString(),
+      chop.toString(),
+      liquidationPenalty.toString(),
+      market.liquidationPenalty.toString(),
+    ]
+  );
+}
+
+
+// Auction used by Dog (new liquidation contract)
+export function handleClipTakeBid(event: TakeEvent): void {
+  const id = event.params.id;
+  let liquidatee = event.params.usr.toHexString();
+  const max = event.params.max;
+  const lot = event.params.lot;
+  const price = event.params.price;
+  const tab = event.params.tab;
+  const owe = event.params.owe;
+
+  const liquidator = event.transaction.from.toHexString();
+  // translate possible proxy/urn handler address to owner address
+  liquidatee = getOwnerAddress(liquidatee);
+
+  const storeID = event.address //clip contract
+    .toHexString()
+    .concat("-")
+    .concat(id.toString());
+  const clipTakeStore = _ClipTakeStore.load(storeID)!;
+  clipTakeStore.slice += INT_ONE;
+  const marketID = clipTakeStore.market;
+  const market = getOrCreateMarket(marketID);
+  const token = new TokenManager(market.inputToken, event);
+  const tokenPrice = token.getPriceUSD(market);
+
+
+  const value = bigIntToBDUseDecimals(lot, token.getDecimals()).times(
+    tokenPrice
+  );
+  log.info(
+    "[handleClipTakeBid]block#={}, storeID={}, clip.id={}, slice #{} event params: max={}, lot={}, price={}, value(lot*price)={}, art={}, tab={}, owe={}, liquidatee={}, liquidator={}",
+    [
+      event.block.number.toString(),
+      storeID, //storeID
+      id.toString(),
+      clipTakeStore.slice.toString(),
+      max.toString(),
+      lot.toString(),
+      price.toString(),
+      value.toString(),
+      clipTakeStore.art.toString(),
+      tab.toString(),
+      owe.toString(),
+      liquidatee,
+      liquidator,
+    ]
+  );
+
+  const deltaLot = clipTakeStore.lot.minus(lot);
+  const amount = bigIntChangeDecimals(deltaLot, WAD, token.getDecimals());
+  const amountUSD = bigIntToBDUseDecimals(amount, token.getDecimals()).times(
+    tokenPrice
+  );
+
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+
+  const amountOwed = bigIntToBDUseDecimals(owe, RAD)
+  const amountOwedUSD = amountOwed.times(tokenManager.getPriceUSD(market));
+  const profitUSD = amountUSD.minus(amountOwedUSD);
+
+  const liquidateID = createEventID(event, Transaction.LIQUIDATE);
+  const liquidate = getOrCreateLiquidate(
+    liquidateID,
+    event,
+    market,
+    liquidatee,
+    liquidator,
+    amount,
+    amountUSD,
+    profitUSD
+  );
+
+  liquidate.positions = clipTakeStore.positions!;
+  liquidate.save();
+
+  if (
+    liquidate.amount.le(BIGINT_ZERO) ||
+    liquidate.amountUSD.le(BIGDECIMAL_ZERO) ||
+    liquidate.profitUSD.le(BIGDECIMAL_ZERO)
+  ) {
+    log.warning(
+      "[handleClipTakeBid]liquidateID={}, storeID={}, clip.id={} slice #{} problematic values: amount={}, amountUSD={}, profitUSD={}",
+      [
+        liquidateID,
+        storeID,
+        id.toString(),
+        clipTakeStore.slice.toString(),
+        liquidate.amount.toString(),
+        liquidate.amountUSD.toString(),
+        liquidate.profitUSD.toString(),
+      ]
+    );
+  }
+
+  clipTakeStore.lot = lot;
+  clipTakeStore.tab = tab;
+  clipTakeStore.save();
+
+  log.info(
+    "[handleClipTakeBid]liquidateID={}, storeID={}, clip.id={}, slice #{} final: amount={}, amountUSD={}, profitUSD={}",
+    [
+      liquidate.id,
+      clipTakeStore.id, //storeID
+      id.toString(),
+      clipTakeStore.slice.toString(),
+      liquidate.amount.toString(),
+      liquidate.amountUSD.toString(),
+      liquidate.profitUSD.toString(),
+    ]
+  );
+
+  log.info(
+    "[handleClipTakeBid]storeID={}, clip.id={} clipTakeStatus: lot={}, tab={}, price={}",
+    [
+      storeID, //storeID
+      id.toString(),
+      clipTakeStore.lot.toString(),
+      clipTakeStore.tab.toString(),
+      tokenPrice.toString(),
+    ]
+  );
+
+  updateUsageMetrics(
+    event,
+    market,
+    [],
+    BIGDECIMAL_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amountUSD,
+    liquidator,
+    liquidatee
+  );
+  updateMarket(
+    event,
+    market,
+    BIGINT_ZERO,
+    BIGDECIMAL_ZERO,
+    BIGINT_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amount,
+    liquidate.amountUSD
+  );
+  updateProtocol(BIGDECIMAL_ZERO, BIGDECIMAL_ZERO, liquidate.amountUSD);
+  updateFinancialsSnapshot(
+    event,
+    BIGDECIMAL_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amountUSD
+  );
+}
+
+// cancel auction
+export function handleClipYankBid(event: ClipYankEvent): void {
+  const id = event.params.id;
+  const storeID = event.address //clip contract
+    .toHexString()
+    .concat("-")
+    .concat(id.toString());
+  const clipTakeStore = _ClipTakeStore.load(storeID)!;
+
+  const clipContract = ClipContract.bind(event.address);
+  const ilk = clipContract.ilk();
+  const sales = clipContract.sales(id);
+  const lot = sales.getLot();
+  const tab = sales.getTab();
+  let liquidatee = sales.getUsr().toHexString();
+
+  const liquidator = event.transaction.from.toHexString();
+  // translate possible proxy/urn handler address to owner address
+  liquidatee = getOwnerAddress(liquidatee);
+  const market = getMarketFromIlk(ilk)!;
+  const token = new TokenManager(market.inputToken, event);
+  const tokenPrice = token.getPriceUSD(market);
+
+  const liquidateID = createEventID(event, Transaction.LIQUIDATE);
+  // convert collateral to its native amount from WAD
+  const amount = bigIntChangeDecimals(lot, WAD, token.getDecimals());
+  const amountUSD = bigIntToBDUseDecimals(amount, token.getDecimals()).times(
+    tokenPrice
+  );
+
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+
+  const outstandingDebt = bigIntToBDUseDecimals(tab, RAD)
+  const outstandingDebtUSD = outstandingDebt.times(tokenManager.getPriceUSD(market));
+  const profitUSD = amountUSD.minus(outstandingDebtUSD);
+
+  const liquidate = getOrCreateLiquidate(
+    liquidateID,
+    event,
+    market,
+    liquidatee,
+    liquidator,
+    amount,
+    amountUSD,
+    profitUSD
+  );
+
+  liquidate.positions = clipTakeStore.positions!;
+  liquidate.save();
+
+  log.info(
+    "[handleClipYankBid]auction for liquidation {} (id {}) cancelled, assuming the msg sender {} won at ${} (profit ${})",
+    [
+      liquidateID,
+      id.toString(),
+      liquidator,
+      liquidate.amountUSD.toString(),
+      liquidate.profitUSD.toString(),
+    ]
+  );
+
+  if (
+    liquidate.amount.le(BIGINT_ZERO) ||
+    liquidate.amountUSD.le(BIGDECIMAL_ZERO) ||
+    liquidate.profitUSD.le(BIGDECIMAL_ZERO)
+  ) {
+    log.warning(
+      "[handleClipTakeBid]problematic values: amount={}, amountUSD={}, profitUSD={}",
+      [
+        liquidate.amount.toString(),
+        liquidate.amountUSD.toString(),
+        liquidate.profitUSD.toString(),
+      ]
+    );
+  }
+
+  updateUsageMetrics(
+    event,
+    market,
+    [],
+    BIGDECIMAL_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amountUSD,
+    liquidator,
+    liquidatee
+  );
+  updateMarket(
+    event,
+    market,
+    BIGINT_ZERO,
+    BIGDECIMAL_ZERO,
+    BIGINT_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amount,
+    liquidate.amountUSD
+  );
+  updateProtocol(BIGDECIMAL_ZERO, BIGDECIMAL_ZERO, liquidate.amountUSD);
+  updateFinancialsSnapshot(
+    event,
+    BIGDECIMAL_ZERO,
+    BIGDECIMAL_ZERO,
+    liquidate.amountUSD
+  );
+}
+
+// Setting mat & par in the Spot contract
+export function handleSpotFileMat(event: SpotFileMatEvent): void {
+  const what = event.params.what.toString();
+  if (what == "mat") {
+    const ilk = event.params.ilk;
+    if (ilk.toString() == "TELEPORT-FW-A") {
+      log.info(
+        "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+        [ilk.toString()]
+      );
+      return;
+    }
+    const market = getMarketFromIlk(ilk);
+    if (market == null) {
+      log.warning("[handleSpotFileMat]Failed to get Market for ilk {}/{}", [
+        ilk.toString(),
+        ilk.toHexString(),
+      ]);
+      return;
+    }
+
+    // 3rd arg: start = 4 + 2 * 32, end = start + 32
+    const mat = event.params.data
+
+    log.info("[handleSpotFileMat]ilk={}, market={}, mat={}", [
+      ilk.toString(),
+      market.id,
+      mat.toString(),
+    ]);
+
+    const protocol = getOrCreateLendingProtocol();
+    const par = protocol._par!;
+    market._mat = mat;
+    if (mat != BIGINT_ZERO) {
+      // mat for the SAI market is 0 and can not be used as deonimnator
+      market.maximumLTV = BIGDECIMAL_ONE_HUNDRED.div(
+        bigIntToBDUseDecimals(mat, RAY)
+      ).div(bigIntToBDUseDecimals(par, RAY));
+      market.liquidationThreshold = market.maximumLTV;
+    }
+    market.save();
+  }
+}
+
+export function handleSpotFilePar(event: SpotFileParEvent): void {
+  const what = event.params.what.toString();
+  if (what == "par") {
+    const par = event.params.data;
+    log.info("[handleSpotFilePar]par={}", [par.toString()]);
+    const protocol = getOrCreateLendingProtocol();
+    protocol._par = par;
+    protocol.save();
+
+    for (let i: i32 = 0; i <= protocol.marketIDList.length; i++) {
+      const market = getOrCreateMarket(protocol.marketIDList[i]);
+      const mat = market._mat;
+      if (mat != BIGINT_ZERO) {
+        // mat is 0 for the SAI market
+        market.maximumLTV = BIGDECIMAL_ONE_HUNDRED.div(
+          bigIntToBDUseDecimals(mat, RAY)
+        ).div(bigIntToBDUseDecimals(par, RAY));
+        market.liquidationThreshold = market.maximumLTV;
+        market.save();
+      }
+    }
+  }
+}
+
+// update token price for ilk market
+export function handleSpotPoke(event: PokeEvent): void {
+  const ilk = event.params.ilk;
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleVatSlip] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  const market = getMarketFromIlk(ilk);
+  if (market == null) {
+    log.warning("[handleSpotPoke]Failed to get Market for ilk {}/{}", [
+      ilk.toString(),
+      ilk.toHexString(),
+    ]);
+    return;
+  }
+
+  const tokenPrice = bigIntToBDUseDecimals(
+    bytesToUnsignedBigInt(event.params.val),
+    WAD
+  );
+
+  const tokenManager = new TokenManager(ZAR_ADDRESS, event);
+  const tokenPriceUSD = tokenPrice.times(tokenManager.getPriceUSD(market));
+  market.save();
+
+  const tokenID = market.inputToken;
+  const token = getOrCreateToken(tokenID);
+  token.lastPriceUSD = tokenPriceUSD;
+  token.lastPriceBlockNumber = event.block.number;
+  token.save();
+
+  updatePriceForMarket(market.id, event);
+  log.info(
+    "[handleSpotPoke]Price of token {} in market {} is updated to {} from {}",
+    [
+      tokenID,
+      market.id,
+      tokenPriceUSD.toString(),
+      token.lastPriceUSD!.toString(),
+    ]
+  );
+}
+
+export function handleJugFileDuty(event: JugFileEvent): void {
+  const ilk = event.params.ilk;
+  if (ilk.toString() == "TELEPORT-FW-A") {
+    log.info(
+      "[handleJugFileDuty] Skip ilk={} (ZAR Teleport: https://github.com/makerdao/dss-teleport)",
+      [ilk.toString()]
+    );
+    return;
+  }
+  const what = event.params.what.toString();
+  if (what == "duty") {
+    const market = getMarketFromIlk(ilk);
+    if (market == null) {
+      log.error("[handleJugFileDuty]Failed to get market for ilk {}/{}", [
+        ilk.toString(),
+        ilk.toHexString(),
+      ]);
+      return;
+    }
+
+    const jugContract = Jug.bind(event.address);
+    const base = jugContract.base();
+    const duty = jugContract.ilks(ilk).value0;
+    const rate = bigIntToBDUseDecimals(base.plus(duty), RAY).minus(
+      BIGDECIMAL_ONE
+    );
+    let rateAnnualized = BIGDECIMAL_ZERO;
+    if (rate.gt(BIGDECIMAL_ZERO)) {
+      rateAnnualized = bigDecimalExponential(
+        rate,
+        SECONDS_PER_YEAR_BIGDECIMAL
+      ).times(BIGDECIMAL_ONE_HUNDRED);
+    }
+    log.info(
+      "[handleJugFileDuty] ilk={}, duty={}, rate={}, rateAnnualized={}",
+      [
+        ilk.toString(),
+        duty.toString(),
+        rate.toString(),
+        rateAnnualized.toString(),
+      ]
+    );
+
+    const interestRateID =
+      InterestRateSide.BORROWER + "-" + InterestRateType.STABLE + "-" + market.id;
+    const interestRate = getOrCreateInterestRate(
+      market.id,
+      InterestRateSide.BORROWER,
+      InterestRateType.STABLE
+    );
+    interestRate.rate = rateAnnualized;
+    interestRate.save();
+
+    market.rates = [interestRateID];
+    market.save();
+    snapshotMarket(event, market);
+  }
+}
+
+// Store cdpi, UrnHandler, and owner address
+export function handleNewCdp(event: NewCdp): void {
+  const cdpi = event.params.cdp;
+  const owner = event.params.own.toHexString().toLowerCase();
+  // if owner is a DSProxy, get the EOA owner of the DSProxy
+  const ownerEOA = getOwnerAddress(owner);
+  const contract = CdpManager.bind(event.address);
+  const urnhandlerAddress = contract.urns(cdpi).toHexString();
+  const ilk = contract.ilks(cdpi);
+  const _cdpi = new _Cdpi(cdpi.toString());
+  _cdpi.urn = urnhandlerAddress.toString();
+  _cdpi.ilk = ilk.toHexString();
+  _cdpi.ownerAddress = ownerEOA;
+  _cdpi.save();
+
+  const _urn = new _Urn(urnhandlerAddress);
+  _urn.ownerAddress = ownerEOA;
+  _urn.cdpi = cdpi;
+  _urn.save();
+
+  log.info("[handleNewCdp]cdpi={}, ilk={}, urn={}, owner={}, EOA={}", [
+    cdpi.toString(),
+    ilk.toString(),
+    urnhandlerAddress,
+    owner,
+    ownerEOA,
+  ]);
+}
+
+// detect if a frob is a migration transaction,
+// if it is, return the address of the caller (owner)
+// if it is not, return null
+// Ref: https://github.com/makerdao/scd-mcd-migration/blob/96b0e1f54a3b646fa15fd4c895401cf8545fda60/src/ScdMcdMigration.sol#L107
+export function getMigrationCaller(
+  u: string,
+  v: string,
+  w: string,
+  event: ethereum.Event
+): string | null {
+  if (!(u == v && u == w && w == v)) return null;
+  const owner = event.transaction.from.toHexString();
+  if (u.toLowerCase() == MIGRATION_ADDRESS) {
+    return owner;
+  }
+  return null;
 }

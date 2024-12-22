@@ -21,7 +21,6 @@ import {
   SECONDS_PER_DAY,
   TransactionType,
 } from "./constants";
-import { SnapshotManager } from "./snapshots";
 import { TokenManager } from "./token";
 import { PositionSide } from "./constants";
 
@@ -45,14 +44,11 @@ export class PositionManager {
     interestType: string | null = null
   ) {
     this.counterID = account.id
-      .toHexString()
       .concat("-")
-      .concat(market.id.toHexString())
+      .concat(market.id)
       .concat("-")
       .concat(side);
-    if (interestType) {
-      this.counterID = this.counterID.concat("-").concat(interestType);
-    }
+
     const positionCounter = _PositionCounter.load(this.counterID);
     if (positionCounter) {
       const positionID = positionCounter.id
@@ -90,7 +86,7 @@ export class PositionManager {
 
   addPosition(
     event: ethereum.Event,
-    asset: Bytes,
+    asset: string,
     protocol: Protocol,
     newBalance: BigInt,
     transactionType: string,
@@ -333,10 +329,6 @@ export class PositionManager {
     if (lastDay == currentDay) {
       return;
     }
-
-    // this is a new active position
-    const snapshots = new SnapshotManager(event, protocol, this.market);
-    snapshots.addDailyActivePosition(this.side);
 
     counter.lastTimestamp = event.block.timestamp;
     counter.save();

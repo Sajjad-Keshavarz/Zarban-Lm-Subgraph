@@ -27,19 +27,19 @@ import { AccountManager } from "./account";
 import {
   activityCounter,
   BIGDECIMAL_ZERO,
-  BIGINT_ZERO,
   exponentToBigDecimal,
   FeeType,
   INT_ONE,
-  INT_ZERO,
   PositionSide,
   Transaction,
   TransactionType,
-  insert
+  insert,
 } from "./constants";
 import { SnapshotManager } from "./snapshots";
 import { TokenManager } from "./token";
 import { PositionManager } from "./position";
+import { getOrCreateLendingProtocol, getOrCreateMarket } from "./getters";
+import { getAssetPriceInUSDC } from "../mapping";
 
 /**
  * This file contains the DataManager, which is used to
@@ -52,7 +52,7 @@ import { PositionManager } from "./position";
 
 export class ProtocolData {
   constructor(
-    public readonly protocolID: Bytes,
+    public readonly protocolID: string,
     public readonly protocol: string,
     public readonly name: string,
     public readonly slug: string,
@@ -81,146 +81,49 @@ export class DataManager {
   private inputToken!: TokenManager;
   private oracle!: Oracle;
   private snapshots!: SnapshotManager;
-  private newMarket: boolean = false;
 
   constructor(
-    marketID: Bytes,
-    inputToken: Bytes,
+    marketID: string,
+    inputToken: string,
     event: ethereum.Event,
-    protocolData: ProtocolData
   ) {
-    this.protocol = this.getOrCreateProtocol(protocolData);
+    this.protocol = this.getOrCreateProtocol();
     this.inputToken = new TokenManager(inputToken, event);
-    let _market = Market.load(marketID);
 
-    // create new market
-    if (!_market) {
-      _market = new Market(marketID);
-      _market.protocol = this.protocol.id;
-      _market.isActive = true;
-      _market.canBorrowFrom = false; // default
-      _market.canUseAsCollateral = false; // default
-      _market.maximumLTV = BIGDECIMAL_ZERO; // default
-      _market.liquidationThreshold = BIGDECIMAL_ZERO; // default
-      _market.liquidationPenalty = BIGDECIMAL_ZERO; // default
-      _market.canIsolate = false; // default
-      _market.inputToken = this.inputToken.getToken().id;
-      _market.inputTokenBalance = BIGINT_ZERO;
-      _market.inputTokenPriceUSD = BIGDECIMAL_ZERO;
-      _market.totalValueLockedUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeSupplySideRevenueUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeProtocolSideRevenueUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeTotalRevenueUSD = BIGDECIMAL_ZERO;
-      _market.totalDepositBalanceUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeDepositUSD = BIGDECIMAL_ZERO;
-      _market.totalBorrowBalanceUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeBorrowUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeLiquidateUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeTransferUSD = BIGDECIMAL_ZERO;
-      _market.cumulativeFlashloanUSD = BIGDECIMAL_ZERO;
-      _market.transactionCount = INT_ZERO;
-      _market.depositCount = INT_ZERO;
-      _market.withdrawCount = INT_ZERO;
-      _market.borrowCount = INT_ZERO;
-      _market.repayCount = INT_ZERO;
-      _market.liquidationCount = INT_ZERO;
-      _market.transferCount = INT_ZERO;
-      _market.flashloanCount = INT_ZERO;
-
-      _market.cumulativeUniqueUsers = INT_ZERO;
-      _market.cumulativeUniqueDepositors = INT_ZERO;
-      _market.cumulativeUniqueBorrowers = INT_ZERO;
-      _market.cumulativeUniqueLiquidators = INT_ZERO;
-      _market.cumulativeUniqueLiquidatees = INT_ZERO;
-      _market.cumulativeUniqueTransferrers = INT_ZERO;
-      _market.cumulativeUniqueFlashloaners = INT_ZERO;
-
-      _market.createdTimestamp = event.block.timestamp;
-      _market.createdBlockNumber = event.block.number;
-
-      _market.positionCount = INT_ZERO;
-      _market.openPositionCount = INT_ZERO;
-      _market.closedPositionCount = INT_ZERO;
-      _market.lendingPositionCount = INT_ZERO;
-      _market.borrowingPositionCount = INT_ZERO;
-      _market.save();
-
-      this.newMarket = true;
-
-      this.protocol.totalPoolCount += INT_ONE;
-      this.protocol.save();
-    }
+    let _market = getOrCreateMarket(marketID, this.inputToken.getToken().name, this.inputToken.getToken().id, event.block.number, event.block.timestamp);
     this.market = _market;
     this.event = event;
 
     // load snapshots
     this.snapshots = new SnapshotManager(event, this.protocol, this.market);
 
-    // load oracle
+    // load oracle and update asset price
     if (this.market.oracle) {
       this.oracle = Oracle.load(this.market.oracle!)!;
+      let assetPriceUSD = getAssetPriceInUSDC(
+        Address.fromString(inputToken),
+        this.getOracleAddress(),
+        event.block.number
+      ) || BIGDECIMAL_ZERO;
+      this.inputToken.updatePrice(assetPriceUSD);
+      this.market.inputTokenPriceUSD = assetPriceUSD;
+      this.saveMarket();
     }
+
   }
 
   /////////////////
   //// Getters ////
   /////////////////
 
-  getOrCreateProtocol(data: ProtocolData): Protocol {
-    let protocol = Protocol.load(data.protocolID);
-    if (!protocol) {
-      protocol = new Protocol(data.protocolID);
-      protocol.protocol = data.protocol;
-      protocol.name = data.name;
-      protocol.slug = data.slug;
-      protocol.network = data.network;
-      protocol.lendingType = data.lendingType;
-      protocol.lenderPermissionType = data.lenderPermissionType;
-      protocol.borrowerPermissionType = data.borrowerPermissionType;
-      protocol.poolCreatorPermissionType = data.poolCreatorPermissionType;
-      protocol.riskType = data.riskType;
-      protocol.collateralizationType = data.collateralizationType;
-
-      protocol.cumulativeUniqueUsers = INT_ZERO;
-      protocol.cumulativeUniqueDepositors = INT_ZERO;
-      protocol.cumulativeUniqueBorrowers = INT_ZERO;
-      protocol.cumulativeUniqueLiquidators = INT_ZERO;
-      protocol.cumulativeUniqueLiquidatees = INT_ZERO;
-      protocol.totalValueLockedUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeSupplySideRevenueUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeProtocolSideRevenueUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeTotalRevenueUSD = BIGDECIMAL_ZERO;
-      protocol.totalDepositBalanceUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeDepositUSD = BIGDECIMAL_ZERO;
-      protocol.totalBorrowBalanceUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeBorrowUSD = BIGDECIMAL_ZERO;
-      protocol.cumulativeLiquidateUSD = BIGDECIMAL_ZERO;
-      protocol.totalPoolCount = INT_ZERO;
-      protocol.openPositionCount = INT_ZERO;
-      protocol.cumulativePositionCount = INT_ZERO;
-      protocol.transactionCount = INT_ZERO;
-      protocol.depositCount = INT_ZERO;
-      protocol.withdrawCount = INT_ZERO;
-      protocol.borrowCount = INT_ZERO;
-      protocol.repayCount = INT_ZERO;
-      protocol.liquidationCount = INT_ZERO;
-      protocol.transferCount = INT_ZERO;
-      protocol.flashloanCount = INT_ZERO;
-      protocol.version = "1.0.0";
-    }
-
-    protocol.save();
-
-    return protocol;
+  getOrCreateProtocol(): Protocol {
+    return getOrCreateLendingProtocol();
   }
 
   getMarket(): Market {
     return this.market;
   }
 
-  isNewMarket(): boolean {
-    return this.newMarket;
-  }
 
   saveMarket(): void {
     this.market.save();
@@ -278,7 +181,7 @@ export class DataManager {
       .concat("-")
       .concat(rateType)
       .concat("-")
-      .concat(this.market.id.toHexString());
+      .concat(this.market.id);
     let rate = InterestRate.load(interestRateID);
     if (!rate) {
       rate = new InterestRate(interestRateID);
@@ -330,10 +233,10 @@ export class DataManager {
   }
 
   getAddress(): Address {
-    return Address.fromBytes(this.market.id);
+    return Address.fromString(this.market.id);
   }
 
-  getOrCreateRevenueDetail(id: Bytes, isMarket: boolean): RevenueDetail {
+  getOrCreateRevenueDetail(id: string, isMarket: boolean): RevenueDetail {
     let details = RevenueDetail.load(id);
     if (!details) {
       details = new RevenueDetail(id);
@@ -358,8 +261,8 @@ export class DataManager {
   //////////////////
 
   createDeposit(
-    asset: Bytes,
-    account: Bytes,
+    asset: string,
+    account: string,
     amount: BigInt,
     amountUSD: BigDecimal,
     newBalance: BigInt,
@@ -391,7 +294,7 @@ export class DataManager {
     const deposit = new Deposit(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.DEPOSIT)
+        .concatI32(Transaction.DEPOSIT).toHexString()
     );
     deposit.hash = this.event.transaction.hash;
     deposit.nonce = this.event.transaction.nonce;
@@ -416,8 +319,8 @@ export class DataManager {
   }
 
   createWithdraw(
-    asset: Bytes,
-    account: Bytes,
+    asset: string,
+    account: string,
     amount: BigInt,
     amountUSD: BigDecimal,
     newBalance: BigInt,
@@ -448,7 +351,7 @@ export class DataManager {
     if (!positionID) {
       log.error(
         "[createWithdraw] positionID is null for market: {} account: {}",
-        [this.market.id.toHexString(), account.toHexString()]
+        [this.market.id, account]
       );
       return null;
     }
@@ -456,7 +359,7 @@ export class DataManager {
     const withdraw = new Withdraw(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.WITHDRAW)
+        .concatI32(Transaction.WITHDRAW).toHexString()
     );
     withdraw.hash = this.event.transaction.hash;
     withdraw.nonce = this.event.transaction.nonce;
@@ -481,8 +384,8 @@ export class DataManager {
   }
 
   createBorrow(
-    asset: Bytes,
-    account: Bytes,
+    asset: string,
+    account: string,
     amount: BigInt,
     amountUSD: BigDecimal,
     newBalance: BigInt,
@@ -515,7 +418,7 @@ export class DataManager {
     const borrow = new Borrow(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.BORROW)
+        .concatI32(Transaction.BORROW).toHexString()
     );
     borrow.hash = this.event.transaction.hash;
     borrow.nonce = this.event.transaction.nonce;
@@ -540,8 +443,8 @@ export class DataManager {
   }
 
   createRepay(
-    asset: Bytes,
-    account: Bytes,
+    asset: string,
+    account: string,
     amount: BigInt,
     amountUSD: BigDecimal,
     newBalance: BigInt,
@@ -569,11 +472,12 @@ export class DataManager {
       tokenPriceUSD,
       principal
     );
+
     const positionID = position.getPositionID();
     if (!positionID) {
       log.error("[createRepay] positionID is null for market: {} account: {}", [
-        this.market.id.toHexString(),
-        account.toHexString(),
+        this.market.id,
+        account,
       ]);
       return null;
     }
@@ -581,7 +485,7 @@ export class DataManager {
     const repay = new Repay(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.REPAY)
+        .concatI32(Transaction.REPAY).toHexString()
     );
     repay.hash = this.event.transaction.hash;
     repay.nonce = this.event.transaction.nonce;
@@ -620,8 +524,8 @@ export class DataManager {
    * @returns A Liquidate entity or null
    */
   createLiquidate(
-    asset: Bytes,
-    debtTokenId: Bytes,
+    asset: string,
+    debtTokenId: string,
     liquidator: Address,
     liquidatee: Address,
     amount: BigInt,
@@ -634,7 +538,7 @@ export class DataManager {
     principal: BigInt | null = null
   ): Liquidate | null {
     const positions: string[] = []; // positions touched by this liquidation
-    const liquidatorAccount = new AccountManager(liquidator);
+    const liquidatorAccount = new AccountManager(liquidator.toHexString());
     if (liquidatorAccount.isNewUser()) {
       this.protocol.cumulativeUniqueUsers += INT_ONE;
       this.protocol.save();
@@ -643,7 +547,7 @@ export class DataManager {
     // Note: Be careful, some protocols might give the liquidated collateral to the liquidator
     //       in collateral in the market. But that is not always the case so we don't do it here.
 
-    const liquidateeAccount = new AccountManager(liquidatee);
+    const liquidateeAccount = new AccountManager(liquidatee.toHexString());
     liquidateeAccount.countLiquidation();
     const collateralPosition = new PositionManager(
       liquidateeAccount.getAccount(),
@@ -663,7 +567,7 @@ export class DataManager {
     if (!collateralPositionID) {
       log.error(
         "[createLiquidate] positionID is null for market: {} account: {}",
-        [this.market.id.toHexString(), liquidatee.toHexString()]
+        [this.market.id, liquidatee.toHexString()]
       );
 
       return null;
@@ -676,7 +580,7 @@ export class DataManager {
       const debtMarket = Market.load(debtTokenId);
       if (!debtMarket) {
         log.error("[createLiquidate] market {} not found", [
-          debtTokenId.toHexString(),
+          debtTokenId,
         ]);
         return null;
       }
@@ -697,7 +601,7 @@ export class DataManager {
       if (!borrowerPositionID) {
         log.error(
           "[createLiquidate] positionID is null for market: {} account: {}",
-          [debtMarket.id.toHexString(), liquidatee.toHexString()]
+          [debtMarket.id, liquidatee.toHexString()]
         );
         return null;
       }
@@ -710,7 +614,7 @@ export class DataManager {
     const liquidate = new Liquidate(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.LIQUIDATE)
+        .concatI32(Transaction.LIQUIDATE).toHexString()
     );
     liquidate.hash = this.event.transaction.hash;
     liquidate.nonce = this.event.transaction.nonce;
@@ -720,8 +624,8 @@ export class DataManager {
     liquidate.gasLimit = this.event.transaction.gasLimit;
     liquidate.blockNumber = this.event.block.number;
     liquidate.timestamp = this.event.block.timestamp;
-    liquidate.liquidator = liquidator;
-    liquidate.liquidatee = liquidatee;
+    liquidate.liquidator = liquidator.toHexString();
+    liquidate.liquidatee = liquidatee.toHexString();
     liquidate.market = this.market.id;
     liquidate.positions = positions;
     liquidate.asset = asset;
@@ -731,8 +635,8 @@ export class DataManager {
     liquidate.save();
 
     this.updateTransactionData(TransactionType.LIQUIDATE, amount, amountUSD);
-    this.updateUsageData(TransactionType.LIQUIDATEE, liquidatee);
-    this.updateUsageData(TransactionType.LIQUIDATOR, liquidator);
+    this.updateUsageData(TransactionType.LIQUIDATEE, liquidatee.toHexString());
+    this.updateUsageData(TransactionType.LIQUIDATOR, liquidator.toHexString());
 
     return liquidate;
   }
@@ -749,7 +653,7 @@ export class DataManager {
     senderPrincipal: BigInt | null = null,
     receiverPrincipal: BigInt | null = null
   ): Transfer | null {
-    const transferrer = new AccountManager(sender);
+    const transferrer = new AccountManager(sender.toHexString());
     if (transferrer.isNewUser()) {
       this.protocol.cumulativeUniqueUsers += INT_ONE;
       this.protocol.save();
@@ -773,12 +677,12 @@ export class DataManager {
     if (!positionID) {
       log.error(
         "[createTransfer] positionID is null for market: {} account: {}",
-        [this.market.id.toHexString(), receiver.toHexString()]
+        [this.market.id, receiver.toHexString()]
       );
       return null;
     }
 
-    const recieverAccount = new AccountManager(receiver);
+    const recieverAccount = new AccountManager(receiver.toHexString());
     recieverAccount.countReceive();
     // receivers are not considered users since they are not spending gas for the transaction
     const receiverPosition = new PositionManager(
@@ -789,7 +693,7 @@ export class DataManager {
     );
     receiverPosition.addPosition(
       this.event,
-      asset,
+      asset.toHexString(),
       this.protocol,
       receiverNewBalance,
       TransactionType.TRANSFER,
@@ -800,7 +704,7 @@ export class DataManager {
     const transfer = new Transfer(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.TRANSFER)
+        .concatI32(Transaction.TRANSFER).toHexString()
     );
     transfer.hash = this.event.transaction.hash;
     transfer.nonce = this.event.transaction.nonce;
@@ -810,17 +714,17 @@ export class DataManager {
     transfer.gasLimit = this.event.transaction.gasLimit;
     transfer.blockNumber = this.event.block.number;
     transfer.timestamp = this.event.block.timestamp;
-    transfer.sender = sender;
-    transfer.receiver = receiver;
+    transfer.sender = sender.toHexString();
+    transfer.receiver = receiver.toHexString();
     transfer.market = this.market.id;
     transfer.positions = [receiverPosition.getPositionID()!, positionID!];
-    transfer.asset = asset;
+    transfer.asset = asset.toHexString();
     transfer.amount = amount;
     transfer.amountUSD = amountUSD;
     transfer.save();
 
     this.updateTransactionData(TransactionType.TRANSFER, amount, amountUSD);
-    this.updateUsageData(TransactionType.TRANSFER, sender);
+    this.updateUsageData(TransactionType.TRANSFER, sender.toHexString());
 
     return transfer;
   }
@@ -831,7 +735,7 @@ export class DataManager {
     amount: BigInt,
     amountUSD: BigDecimal
   ): Flashloan {
-    const flashloaner = new AccountManager(account);
+    const flashloaner = new AccountManager(account.toHexString());
     if (flashloaner.isNewUser()) {
       this.protocol.cumulativeUniqueUsers += INT_ONE;
       this.protocol.save();
@@ -841,7 +745,7 @@ export class DataManager {
     const flashloan = new Flashloan(
       this.event.transaction.hash
         .concatI32(this.event.logIndex.toI32())
-        .concatI32(Transaction.FLASHLOAN)
+        .concatI32(Transaction.FLASHLOAN).toHexString()
     );
     flashloan.hash = this.event.transaction.hash;
     flashloan.nonce = this.event.transaction.nonce;
@@ -851,15 +755,15 @@ export class DataManager {
     flashloan.gasLimit = this.event.transaction.gasLimit;
     flashloan.blockNumber = this.event.block.number;
     flashloan.timestamp = this.event.block.timestamp;
-    flashloan.account = account;
+    flashloan.account = account.toHexString();
     flashloan.market = this.market.id;
-    flashloan.asset = asset;
+    flashloan.asset = asset.toHexString();
     flashloan.amount = amount;
     flashloan.amountUSD = amountUSD;
     flashloan.save();
 
     this.updateTransactionData(TransactionType.FLASHLOAN, amount, amountUSD);
-    this.updateUsageData(TransactionType.FLASHLOAN, account);
+    this.updateUsageData(TransactionType.FLASHLOAN, account.toHexString());
 
     return flashloan;
   }
@@ -974,7 +878,7 @@ export class DataManager {
       const _market = Market.load(marketList[i].id);
       if (!_market) {
         log.error("[updateMarketAndProtocolData] Market not found: {}", [
-          marketList[i].id.toHexString(),
+          marketList[i].id,
         ]);
         continue;
       }
@@ -1089,7 +993,7 @@ export class DataManager {
   // (ie, market and protocol)
   private updateUsageData(
     transactionType: string,
-    account: Bytes,
+    account: string,
   ): void {
     this.market.cumulativeUniqueUsers += activityCounter(
       account,
@@ -1215,6 +1119,10 @@ export class DataManager {
       this.protocol.liquidationCount += INT_ONE;
       this.protocol.cumulativeLiquidateUSD =
         this.protocol.cumulativeLiquidateUSD.plus(amountUSD);
+      const reserveFactor = this.market.reserveFactor
+      if (reserveFactor)
+        this.protocol._cumulativeProtocolSideLiquidationRevenue =
+          this.protocol._cumulativeProtocolSideLiquidationRevenue!.plus(amountUSD.times(reserveFactor))
       this.market.cumulativeLiquidateUSD =
         this.market.cumulativeLiquidateUSD.plus(amountUSD);
       this.market.liquidationCount += INT_ONE;

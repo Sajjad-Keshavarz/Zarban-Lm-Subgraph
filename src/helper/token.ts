@@ -5,18 +5,27 @@ import {
   Address,
   BigDecimal,
   BigInt,
-  Bytes,
   ethereum,
+  log,
 } from "@graphprotocol/graph-ts";
-import { RewardToken, Token } from "../../generated/schema";
+import { _DefaultOracle, Market, Oracle, RewardToken, Token } from "../../generated/schema";
 import {
   BIGDECIMAL_ZERO,
   INT_EIGHTTEEN,
   INT_NINE,
   INT_SIXTEEN,
   INT_ZERO,
+  ZAR_ADDRESS,
   exponentToBigDecimal,
+  ZAR_INIT_PRICE_USD,
+  DAI_ADDRESS,
+  ETH_ADDRESS,
+  WSTETH_ADDRESS,
+  WSTETH_INIT_PRICE_USD,
+  ETH_INIT_PRICE_USD,
+  DAI_INIT_PRICE_USD,
 } from "./constants";
+import { getAssetPriceInUSDC, getProtocolData } from "../mapping";
 
 /**
  * This file contains the TokenClass, which acts as
@@ -32,18 +41,32 @@ export class TokenManager {
   private event!: ethereum.Event;
 
   constructor(
-    tokenAddress: Bytes,
+    tokenAddress: string,
     event: ethereum.Event,
     tokenType: string | null = null
   ) {
-    let _token = Token.load(tokenAddress);
+    let _token = Token.load(tokenAddress.toLowerCase());
     if (!_token) {
       _token = new Token(tokenAddress);
-      _token.name = this.fetchTokenName(Address.fromBytes(tokenAddress));
-      _token.symbol = this.fetchTokenSymbol(Address.fromBytes(tokenAddress));
+      _token.name = this.fetchTokenName(Address.fromString(tokenAddress));
+      _token.symbol = this.fetchTokenSymbol(Address.fromString(tokenAddress));
       _token.decimals = this.fetchTokenDecimals(
-        Address.fromBytes(tokenAddress)
+        Address.fromString(tokenAddress)
       );
+
+      if (tokenAddress.toLowerCase() == ZAR_ADDRESS) {
+        _token.lastPriceUSD = ZAR_INIT_PRICE_USD;
+      }
+      else if (tokenAddress.toLowerCase() == DAI_ADDRESS) {
+        _token.lastPriceUSD = DAI_INIT_PRICE_USD;
+      }
+      else if (tokenAddress.toLowerCase() == ETH_ADDRESS) {
+        _token.lastPriceUSD = ETH_INIT_PRICE_USD;
+      }
+      else if (tokenAddress.toLowerCase() == WSTETH_ADDRESS) {
+        _token.lastPriceUSD = WSTETH_INIT_PRICE_USD;
+      }
+
       if (tokenType) {
         _token.type = tokenType;
       }
@@ -72,19 +95,36 @@ export class TokenManager {
     this.token.save();
   }
 
-  getPriceUSD(): BigDecimal {
+  getPriceUSD(market: Market): BigDecimal {
     if (this.token.lastPriceUSD) {
       return this.token.lastPriceUSD!;
+    } else {
+      let defaultOracle = _DefaultOracle.load(getProtocolData().protocolID);
+      if (defaultOracle) {
+        const oracle = Oracle.load(defaultOracle.oracle.toHexString());
+        if (oracle) {
+          let assetPriceUSD = getAssetPriceInUSDC(
+            Address.fromString(this.token.id),
+            Address.fromBytes(oracle.oracleAddress),
+            this.event.block.number
+          ) || BIGDECIMAL_ZERO;
+          this.updatePrice(assetPriceUSD);
+          market.inputTokenPriceUSD = assetPriceUSD;
+          return assetPriceUSD;
+        }
+      }
     }
     return BIGDECIMAL_ZERO;
   }
 
   // convert token amount to USD value
-  getAmountUSD(amount: BigInt): BigDecimal {
+  getAmountUSD(amount: BigInt, market: Market): BigDecimal {
+    const price = this.getPriceUSD(market)
+    market.save()
     return amount
       .toBigDecimal()
       .div(exponentToBigDecimal(this.getDecimals()))
-      .times(this.getPriceUSD());
+      .times(price);
   }
   ////////////////////
   ///// Creators /////
@@ -93,8 +133,8 @@ export class TokenManager {
   getOrCreateRewardToken(rewardTokenType: string): RewardToken {
     const rewardTokenID = rewardTokenType
       .concat("-")
-      .concat(this.token.id.toHexString());
-    let rewardToken = RewardToken.load(rewardTokenID);
+      .concat(this.token.id);
+    let rewardToken = RewardToken.load(rewardTokenID.toLowerCase());
     if (!rewardToken) {
       rewardToken = new RewardToken(rewardTokenID);
       rewardToken.token = this.token.id;

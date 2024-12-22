@@ -15,7 +15,7 @@ export class AccountManager {
   private isNew: boolean; // true if the account was created
   private account: Account;
 
-  constructor(account: Bytes) {
+  constructor(account: string) {
     let _account = Account.load(account);
     if (!_account) {
       _account = new Account(account);
@@ -31,6 +31,7 @@ export class AccountManager {
       _account.transferredCount = INT_ZERO;
       _account.receivedCount = INT_ZERO;
       _account.flashloanCount = INT_ZERO;
+      _account._positionIDList = [];
       _account.save();
       this.isNew = true;
     } else {
